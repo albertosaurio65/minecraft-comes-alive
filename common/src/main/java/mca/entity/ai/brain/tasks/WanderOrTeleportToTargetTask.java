@@ -1,18 +1,24 @@
 package mca.entity.ai.brain.tasks;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.gson.JsonSyntaxException;
 import mca.Config;
 import mca.entity.ai.MemoryModuleTypeMCA;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
+import net.minecraft.entity.ai.NoPenaltyTargeting;
 import net.minecraft.entity.ai.brain.Brain;
 import net.minecraft.entity.ai.brain.MemoryModuleState;
 import net.minecraft.entity.ai.brain.MemoryModuleType;
 import net.minecraft.entity.ai.brain.WalkTarget;
+import net.minecraft.entity.ai.brain.task.Task;
 import net.minecraft.entity.ai.brain.task.WanderAroundTask;
+import net.minecraft.entity.ai.pathing.EntityNavigation;
 import net.minecraft.entity.ai.pathing.LandPathNodeMaker;
+import net.minecraft.entity.ai.pathing.Path;
 import net.minecraft.entity.ai.pathing.PathNodeType;
 import net.minecraft.entity.mob.MobEntity;
+import net.minecraft.entity.mob.PathAwareEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.tag.ServerTagManagerHolder;
 import net.minecraft.tag.Tag;
@@ -20,35 +26,134 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.registry.Registry;
+import org.jetbrains.annotations.Nullable;
 
-public class WanderOrTeleportToTargetTask extends WanderAroundTask {
+import java.util.Optional;
+
+public class WanderOrTeleportToTargetTask extends Task<MobEntity> {
+
+    private static final int MAX_UPDATE_COUNTDOWN = 40;
+    private int pathUpdateCountdownTicks;
+    @Nullable
+    private Path path;
+    @Nullable
+    private BlockPos lookTargetPos;
+    private float speed;
 
     public WanderOrTeleportToTargetTask() {
+        this(150, 250);
     }
 
     public WanderOrTeleportToTargetTask(int minRunTime, int maxRunTime) {
-        super(minRunTime, maxRunTime);
+        super(ImmutableMap.of(MemoryModuleType.CANT_REACH_WALK_TARGET_SINCE, MemoryModuleState.REGISTERED, MemoryModuleType.PATH, MemoryModuleState.VALUE_ABSENT, MemoryModuleType.WALK_TARGET, MemoryModuleState.VALUE_PRESENT), minRunTime, maxRunTime);
     }
 
     @Override
     protected boolean shouldRun(ServerWorld serverWorld, MobEntity mobEntity) {
-        return super.shouldRun(serverWorld, mobEntity)
-                && mobEntity.getBrain().isMemoryInState(MemoryModuleTypeMCA.STAYING, MemoryModuleState.VALUE_ABSENT);
+        if (this.pathUpdateCountdownTicks > 0) {
+            --this.pathUpdateCountdownTicks;
+            return false;
+        } else {
+            Brain<?> brain = mobEntity.getBrain();
+            WalkTarget walkTarget = brain.getOptionalMemory(MemoryModuleType.WALK_TARGET).get();
+            boolean bl = this.hasReached(mobEntity, walkTarget);
+            boolean bl2 = brain.isMemoryInState(MemoryModuleTypeMCA.STAYING, MemoryModuleState.VALUE_ABSENT);
+            if (!bl && bl2 && this.hasFinishedPath(mobEntity, walkTarget, serverWorld.getTime())) {
+                this.lookTargetPos = walkTarget.getLookTarget().getBlockPos();
+                return true;
+            } else {
+                brain.forget(MemoryModuleType.WALK_TARGET);
+                if (bl) {
+                    brain.forget(MemoryModuleType.CANT_REACH_WALK_TARGET_SINCE);
+                }
+
+                return false;
+            }
+        }
     }
 
     @Override
-    protected void keepRunning(ServerWorld world, MobEntity entity, long l) {
-        if (Config.getInstance().allowVillagerTeleporting) {
-            WalkTarget walkTarget = entity.getBrain().getOptionalMemory(MemoryModuleType.WALK_TARGET).get();
-            BlockPos targetPos = walkTarget.getLookTarget().getBlockPos();
+    protected boolean shouldKeepRunning(ServerWorld serverWorld, MobEntity mobEntity, long l) {
+        if (this.path != null && this.lookTargetPos != null) {
+            Optional<WalkTarget> optional = mobEntity.getBrain().getOptionalMemory(MemoryModuleType.WALK_TARGET);
+            EntityNavigation entityNavigation = mobEntity.getNavigation();
+            return !entityNavigation.isIdle() && optional.isPresent() && !this.hasReached(mobEntity, optional.get());
+        } else {
+            return false;
+        }
+    }
 
-            // If the target is more than x blocks away, teleport to it immediately.
-            if (!targetPos.isWithinDistance(entity.getPos(), Config.getInstance().villagerTeleportLimit)) {
-                tryTeleport(world, entity, targetPos);
+    @Override
+    protected void finishRunning(ServerWorld serverWorld, MobEntity mobEntity, long l) {
+        if (mobEntity.getBrain().hasMemoryModule(MemoryModuleType.WALK_TARGET) && !this.hasReached(mobEntity, (WalkTarget)mobEntity.getBrain().getOptionalMemory(MemoryModuleType.WALK_TARGET).get()) && mobEntity.getNavigation().isNearPathStartPos()) {
+            this.pathUpdateCountdownTicks = serverWorld.getRandom().nextInt(MAX_UPDATE_COUNTDOWN);
+        }
+
+        mobEntity.getNavigation().stop();
+        mobEntity.getBrain().forget(MemoryModuleType.WALK_TARGET);
+        mobEntity.getBrain().forget(MemoryModuleType.PATH);
+        this.path = null;
+    }
+
+    @Override
+    protected void run(ServerWorld serverWorld, MobEntity mobEntity, long l) {
+        mobEntity.getBrain().remember(MemoryModuleType.PATH, this.path);
+        mobEntity.getNavigation().startMovingAlong(this.path, this.speed);
+    }
+
+    @Override
+    protected void keepRunning(ServerWorld serverWorld, MobEntity mobEntity, long l) {
+        Path path = mobEntity.getNavigation().getCurrentPath();
+        Brain<?> brain = mobEntity.getBrain();
+        if (this.path != path) {
+            this.path = path;
+            brain.remember(MemoryModuleType.PATH, path);
+        }
+
+        if (path != null && this.lookTargetPos != null) {
+            WalkTarget walkTarget = brain.getOptionalMemory(MemoryModuleType.WALK_TARGET).get();
+            if (walkTarget.getLookTarget().getBlockPos().getSquaredDistance(this.lookTargetPos) > 4.0D && this.hasFinishedPath(mobEntity, walkTarget, serverWorld.getTime())) {
+                this.lookTargetPos = walkTarget.getLookTarget().getBlockPos();
+                if (Config.getInstance().allowVillagerTeleporting && !lookTargetPos.isWithinDistance(mobEntity.getPos(), Config.getInstance().villagerTeleportLimit)) {
+                    tryTeleport(serverWorld, mobEntity, lookTargetPos);
+                } else {
+                    this.run(serverWorld, mobEntity, l);
+                }
+            }
+        }
+    }
+
+    private boolean hasFinishedPath(MobEntity entity, WalkTarget walkTarget, long time) {
+        BlockPos blockPos = walkTarget.getLookTarget().getBlockPos();
+        this.path = entity.getNavigation().findPathTo(blockPos, 0);
+        this.speed = walkTarget.getSpeed();
+        Brain<?> brain = entity.getBrain();
+        if (this.hasReached(entity, walkTarget)) {
+            brain.forget(MemoryModuleType.CANT_REACH_WALK_TARGET_SINCE);
+        } else {
+            boolean bl = this.path != null && this.path.reachesTarget();
+            if (bl) {
+                brain.forget(MemoryModuleType.CANT_REACH_WALK_TARGET_SINCE);
+            } else if (!brain.hasMemoryModule(MemoryModuleType.CANT_REACH_WALK_TARGET_SINCE)) {
+                brain.remember(MemoryModuleType.CANT_REACH_WALK_TARGET_SINCE, time);
+            }
+
+            if (this.path != null) {
+                return true;
+            }
+
+            Vec3d vec3d = NoPenaltyTargeting.findTo((PathAwareEntity)entity, 10, 7, Vec3d.ofBottomCenter(blockPos), Math.PI * 0.5);
+            if (vec3d != null) {
+                this.path = entity.getNavigation().findPathTo(vec3d.x, vec3d.y, vec3d.z, 0);
+                return this.path != null;
             }
         }
 
-        super.keepRunning(world, entity, l);
+        return false;
+    }
+
+    private boolean hasReached(MobEntity entity, WalkTarget walkTarget) {
+        return walkTarget.getLookTarget().getBlockPos().getManhattanDistance(entity.getBlockPos()) <= walkTarget.getCompletionRange();
     }
 
     private void tryTeleport(ServerWorld world, MobEntity entity, BlockPos targetPos) {
